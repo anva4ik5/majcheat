@@ -141,6 +141,31 @@ async function authMiddleware(req, res, next) {
   next();
 }
 
+// Simple in-memory rate limiter (per IP, sliding 1-min window)
+const rateLimitStore = new Map();
+function rateLimit(maxPerMinute) {
+  return (req, res, next) => {
+    const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown';
+    const now = Date.now();
+    const windowStart = now - 60000;
+    const arr = (rateLimitStore.get(ip) || []).filter(t => t > windowStart);
+    if (arr.length >= maxPerMinute) {
+      return res.status(429).json({ success: false, message: 'Too many requests, slow down' });
+    }
+    arr.push(now);
+    rateLimitStore.set(ip, arr);
+    next();
+  };
+}
+// Cleanup old entries every 5 min
+setInterval(() => {
+  const cutoff = Date.now() - 60000;
+  for (const [ip, arr] of rateLimitStore.entries()) {
+    const f = arr.filter(t => t > cutoff);
+    if (f.length === 0) rateLimitStore.delete(ip); else rateLimitStore.set(ip, f);
+  }
+}, 5 * 60 * 1000);
+
 // ========== API ROUTES ==========
 
 app.get('/api/health', (req, res) => {
@@ -179,7 +204,7 @@ async function notifyTelegram(telegramId, message) {
 // ========== AUTH ENDPOINTS ==========
 
 // Step 1 of registration: client sends login/password/telegram_id, gets session_id, bot sends code
-app.post('/api/auth/register/start', authMiddleware, asyncHandler(async (req, res) => {
+app.post('/api/auth/register/start', rateLimit(5), asyncHandler(async (req, res) => {
   const { login, password, telegram_id, hwid } = req.body;
   
   if (!isValidLogin(login)) {
@@ -232,7 +257,7 @@ app.post('/api/auth/register/start', authMiddleware, asyncHandler(async (req, re
 }));
 
 // Step 2 of registration: confirm code
-app.post('/api/auth/register/confirm', authMiddleware, asyncHandler(async (req, res) => {
+app.post('/api/auth/register/confirm', rateLimit(10), asyncHandler(async (req, res) => {
   const { session_id, code } = req.body;
   
   if (!session_id || !code) {
@@ -285,7 +310,7 @@ app.post('/api/auth/register/confirm', authMiddleware, asyncHandler(async (req, 
 }));
 
 // Login: verify credentials, optionally send Telegram code for new HWID
-app.post('/api/auth/login', authMiddleware, asyncHandler(async (req, res) => {
+app.post('/api/auth/login', rateLimit(10), asyncHandler(async (req, res) => {
   const { login, password, hwid } = req.body;
   
   if (!login || !password || !hwid) {
@@ -353,7 +378,7 @@ app.post('/api/auth/login', authMiddleware, asyncHandler(async (req, res) => {
 }));
 
 // Confirm login from new device
-app.post('/api/auth/login/confirm', authMiddleware, asyncHandler(async (req, res) => {
+app.post('/api/auth/login/confirm', rateLimit(10), asyncHandler(async (req, res) => {
   const { session_id, code } = req.body;
   
   if (!session_id || !code) {
@@ -404,7 +429,7 @@ app.post('/api/auth/login/confirm', authMiddleware, asyncHandler(async (req, res
 }));
 
 // Verify token (used by client on launch)
-app.post('/api/auth/verify', authMiddleware, asyncHandler(async (req, res) => {
+app.post('/api/auth/verify', rateLimit(30), asyncHandler(async (req, res) => {
   const { token, hwid } = req.body;
   
   if (!token) {
@@ -439,7 +464,7 @@ app.post('/api/auth/verify', authMiddleware, asyncHandler(async (req, res) => {
 }));
 
 // Logout
-app.post('/api/auth/logout', authMiddleware, asyncHandler(async (req, res) => {
+app.post('/api/auth/logout', asyncHandler(async (req, res) => {
   const { token } = req.body;
   if (token) {
     await pool.query('DELETE FROM auth_tokens WHERE token = $1', [token]);
