@@ -29,7 +29,7 @@ const pool = new Pool({
   ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
 });
 
-const telegramBot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN, { polling: true });
+const telegramBot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN, { polling: false });
 
 // Generate license key
 function generateLicenseKey() {
@@ -397,9 +397,43 @@ telegramBot.on('callback_query', async (query) => {
   }
 });
 
+// Webhook endpoint for Telegram
+app.post('/webhook', express.raw({type: 'application/json'}), (req, res) => {
+  try {
+    telegramBot.processUpdate(req.body);
+    res.sendStatus(200);
+  } catch (err) {
+    console.error('Webhook error:', err);
+    res.sendStatus(500);
+  }
+});
+
 // Start server
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
+const server = app.listen(PORT, async () => {
   console.log(`Server running on port ${PORT}`);
   console.log(`Health check: http://localhost:${PORT}/api/health`);
+  
+  // Setup webhook for Railway
+  const domain = process.env.RAILWAY_PUBLIC_DOMAIN || process.env.RAILWAY_STATIC_URL;
+  if (domain) {
+    const webhookUrl = `https://${domain}/webhook`;
+    try {
+      await telegramBot.setWebhook(webhookUrl);
+      console.log(`Webhook set: ${webhookUrl}`);
+    } catch (err) {
+      console.error('Failed to set webhook:', err.message);
+    }
+  } else {
+    console.log('No RAILWAY_PUBLIC_DOMAIN found. Set webhook manually if needed.');
+  }
+});
+
+// Graceful shutdown
+process.on('SIGTERM', () => {
+  console.log('SIGTERM received, shutting down gracefully');
+  server.close(() => {
+    console.log('Server closed');
+    process.exit(0);
+  });
 });
