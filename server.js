@@ -3,6 +3,7 @@ const cors = require('cors');
 const { Pool } = require('pg');
 const TelegramBot = require('node-telegram-bot-api');
 const crypto = require('crypto');
+const https = require('https');
 require('dotenv').config();
 
 const app = express();
@@ -408,6 +409,38 @@ app.post('/webhook', express.raw({type: 'application/json'}), (req, res) => {
   }
 });
 
+// Setup webhook via direct Telegram API call (robust, no library method dependency)
+function setTelegramWebhook(token, url) {
+  return new Promise((resolve, reject) => {
+    const data = JSON.stringify({ url });
+    const options = {
+      hostname: 'api.telegram.org',
+      path: `/bot${token}/setWebhook`,
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(data)
+      }
+    };
+    const req = https.request(options, (res) => {
+      let body = '';
+      res.on('data', chunk => body += chunk);
+      res.on('end', () => {
+        try {
+          const json = JSON.parse(body);
+          if (json.ok) resolve(json);
+          else reject(new Error(json.description || 'Unknown error'));
+        } catch (e) {
+          resolve(body);
+        }
+      });
+    });
+    req.on('error', reject);
+    req.write(data);
+    req.end();
+  });
+}
+
 // Start server
 const PORT = process.env.PORT || 3000;
 const server = app.listen(PORT, async () => {
@@ -415,11 +448,12 @@ const server = app.listen(PORT, async () => {
   console.log(`Health check: http://localhost:${PORT}/api/health`);
   
   // Setup webhook for Railway
-  const domain = process.env.RAILWAY_PUBLIC_DOMAIN || process.env.RAILWAY_STATIC_URL;
+  const domain = process.env.RAILWAY_PUBLIC_DOMAIN || process.env.RAILWAY_STATIC_URL || process.env.BASE_URL;
   if (domain) {
-    const webhookUrl = `https://${domain}/webhook`;
+    const cleanDomain = domain.replace(/^https?:\/\//, '');
+    const webhookUrl = `https://${cleanDomain}/webhook`;
     try {
-      await telegramBot.setWebhook(webhookUrl);
+      await setTelegramWebhook(process.env.TELEGRAM_BOT_TOKEN, webhookUrl);
       console.log(`Webhook set: ${webhookUrl}`);
     } catch (err) {
       console.error('Failed to set webhook:', err.message);
