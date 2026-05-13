@@ -4,6 +4,8 @@ const { Pool } = require('pg');
 const TelegramBot = require('node-telegram-bot-api');
 const crypto = require('crypto');
 const https = require('https');
+const bcrypt = require('bcrypt');
+const { v4: uuidv4 } = require('uuid');
 require('dotenv').config();
 
 const app = express();
@@ -58,8 +60,20 @@ async function isAdmin(telegramId) {
 async function initDB() {
   try {
     await pool.query(`CREATE TABLE IF NOT EXISTS users (
-      id SERIAL PRIMARY KEY, telegram_id VARCHAR(255) UNIQUE, username VARCHAR(255), hwid VARCHAR(255), license_key VARCHAR(255), created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, is_active BOOLEAN DEFAULT true
+      id SERIAL PRIMARY KEY,
+      telegram_id VARCHAR(255) UNIQUE,
+      username VARCHAR(255),
+      login VARCHAR(64) UNIQUE,
+      password_hash VARCHAR(255),
+      hwid VARCHAR(255),
+      license_key VARCHAR(255),
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      is_active BOOLEAN DEFAULT true
     )`);
+
+    // Migrations for legacy schema
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS login VARCHAR(64) UNIQUE`);
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash VARCHAR(255)`);
     
     await pool.query(`CREATE TABLE IF NOT EXISTS licenses (
       id SERIAL PRIMARY KEY, key VARCHAR(255) UNIQUE, hwid VARCHAR(255), telegram_id VARCHAR(255), duration_days INTEGER, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, expires_at TIMESTAMP, is_active BOOLEAN DEFAULT true, hwid_bound BOOLEAN DEFAULT false
@@ -71,6 +85,31 @@ async function initDB() {
     
     await pool.query(`CREATE TABLE IF NOT EXISTS logs (
       id SERIAL PRIMARY KEY, telegram_id VARCHAR(255), action VARCHAR(255), details TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )`);
+    
+    // Two-step auth sessions: register/login confirmation via Telegram code
+    await pool.query(`CREATE TABLE IF NOT EXISTS auth_sessions (
+      id SERIAL PRIMARY KEY,
+      session_id VARCHAR(64) UNIQUE,
+      type VARCHAR(16),
+      login VARCHAR(64),
+      password_hash VARCHAR(255),
+      telegram_id VARCHAR(255),
+      hwid VARCHAR(255),
+      code VARCHAR(8),
+      verified BOOLEAN DEFAULT false,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      expires_at TIMESTAMP
+    )`);
+
+    // Auth tokens for client sessions
+    await pool.query(`CREATE TABLE IF NOT EXISTS auth_tokens (
+      id SERIAL PRIMARY KEY,
+      token VARCHAR(255) UNIQUE,
+      user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+      hwid VARCHAR(255),
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      expires_at TIMESTAMP
     )`);
     
     console.log('Database initialized successfully');
@@ -107,6 +146,306 @@ async function authMiddleware(req, res, next) {
 app.get('/api/health', (req, res) => {
   res.json({ success: true, timestamp: new Date().toISOString() });
 });
+
+// ========== AUTH HELPERS ==========
+
+function generateCode() {
+  return Math.floor(100000 + Math.random() * 900000).toString();
+}
+
+function generateToken() {
+  return crypto.randomBytes(32).toString('hex');
+}
+
+function isValidLogin(login) {
+  return /^[a-zA-Z0-9_]{3,32}$/.test(login);
+}
+
+function isValidPassword(password) {
+  return typeof password === 'string' && password.length >= 6 && password.length <= 64;
+}
+
+// Notify user via Telegram with code
+async function notifyTelegram(telegramId, message) {
+  try {
+    await telegramBot.sendMessage(telegramId, message, { parse_mode: 'HTML' });
+    return true;
+  } catch (err) {
+    console.error('Telegram notify error:', err.message);
+    return false;
+  }
+}
+
+// ========== AUTH ENDPOINTS ==========
+
+// Step 1 of registration: client sends login/password/telegram_id, gets session_id, bot sends code
+app.post('/api/auth/register/start', authMiddleware, asyncHandler(async (req, res) => {
+  const { login, password, telegram_id, hwid } = req.body;
+  
+  if (!isValidLogin(login)) {
+    return res.status(400).json({ success: false, message: 'Invalid login (3-32 chars, a-z, 0-9, _)' });
+  }
+  if (!isValidPassword(password)) {
+    return res.status(400).json({ success: false, message: 'Password must be 6-64 chars' });
+  }
+  if (!telegram_id || !/^\d+$/.test(telegram_id.toString())) {
+    return res.status(400).json({ success: false, message: 'Invalid telegram_id' });
+  }
+  if (!hwid) {
+    return res.status(400).json({ success: false, message: 'HWID required' });
+  }
+  
+  // Check login uniqueness
+  const exists = await pool.query('SELECT id FROM users WHERE login = $1', [login]);
+  if (exists.rows.length > 0) {
+    return res.json({ success: false, message: 'Login already taken' });
+  }
+  
+  // Check telegram_id not already linked
+  const tgExists = await pool.query('SELECT id FROM users WHERE telegram_id = $1 AND login IS NOT NULL', [telegram_id.toString()]);
+  if (tgExists.rows.length > 0) {
+    return res.json({ success: false, message: 'Telegram already registered' });
+  }
+  
+  const sessionId = uuidv4();
+  const code = generateCode();
+  const passwordHash = await bcrypt.hash(password, 10);
+  const expiresAt = new Date(Date.now() + 10 * 60 * 1000); // 10 min
+  
+  await pool.query(
+    `INSERT INTO auth_sessions (session_id, type, login, password_hash, telegram_id, hwid, code, expires_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+    [sessionId, 'register', login, passwordHash, telegram_id.toString(), hwid, code, expiresAt]
+  );
+  
+  const sent = await notifyTelegram(telegram_id, 
+    `🔐 <b>Регистрация</b>\n\nКод подтверждения: <code>${code}</code>\n\nВведите его в клиенте.\nКод действует 10 минут.\n\nЛогин: <code>${login}</code>`);
+  
+  if (!sent) {
+    return res.json({ 
+      success: false, 
+      message: 'Не удалось отправить код в Telegram. Сначала запустите бота: /start' 
+    });
+  }
+  
+  res.json({ success: true, session_id: sessionId, message: 'Code sent to Telegram' });
+}));
+
+// Step 2 of registration: confirm code
+app.post('/api/auth/register/confirm', authMiddleware, asyncHandler(async (req, res) => {
+  const { session_id, code } = req.body;
+  
+  if (!session_id || !code) {
+    return res.status(400).json({ success: false, message: 'session_id and code required' });
+  }
+  
+  const result = await pool.query(
+    `SELECT * FROM auth_sessions WHERE session_id = $1 AND type = 'register' AND verified = false`,
+    [session_id]
+  );
+  if (result.rows.length === 0) {
+    return res.json({ success: false, message: 'Invalid or expired session' });
+  }
+  
+  const session = result.rows[0];
+  if (new Date(session.expires_at) < new Date()) {
+    return res.json({ success: false, message: 'Code expired' });
+  }
+  if (session.code !== code.toString()) {
+    return res.json({ success: false, message: 'Invalid code' });
+  }
+  
+  // Create user
+  const insertRes = await pool.query(
+    `INSERT INTO users (login, password_hash, telegram_id, hwid, is_active)
+     VALUES ($1, $2, $3, $4, true)
+     ON CONFLICT (telegram_id) DO UPDATE SET login = $1, password_hash = $2, hwid = $4
+     RETURNING id`,
+    [session.login, session.password_hash, session.telegram_id, session.hwid]
+  );
+  
+  await pool.query('UPDATE auth_sessions SET verified = true WHERE session_id = $1', [session_id]);
+  
+  // Generate auth token
+  const token = generateToken();
+  const tokenExpires = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000); // 30 days
+  await pool.query(
+    'INSERT INTO auth_tokens (token, user_id, hwid, expires_at) VALUES ($1, $2, $3, $4)',
+    [token, insertRes.rows[0].id, session.hwid, tokenExpires]
+  );
+  
+  await pool.query('INSERT INTO logs (telegram_id, action, details) VALUES ($1, $2, $3)',
+    [session.telegram_id, 'REGISTER', `Login: ${session.login}`]);
+  
+  res.json({ 
+    success: true, 
+    token, 
+    user: { id: insertRes.rows[0].id, login: session.login, telegram_id: session.telegram_id }
+  });
+}));
+
+// Login: verify credentials, optionally send Telegram code for new HWID
+app.post('/api/auth/login', authMiddleware, asyncHandler(async (req, res) => {
+  const { login, password, hwid } = req.body;
+  
+  if (!login || !password || !hwid) {
+    return res.status(400).json({ success: false, message: 'login, password, hwid required' });
+  }
+  
+  const result = await pool.query('SELECT * FROM users WHERE login = $1', [login]);
+  if (result.rows.length === 0) {
+    return res.json({ success: false, message: 'Invalid credentials' });
+  }
+  
+  const user = result.rows[0];
+  if (!user.is_active) {
+    return res.json({ success: false, message: 'Account banned' });
+  }
+  if (!user.password_hash) {
+    return res.json({ success: false, message: 'Account not registered properly' });
+  }
+  
+  const ok = await bcrypt.compare(password, user.password_hash);
+  if (!ok) {
+    return res.json({ success: false, message: 'Invalid credentials' });
+  }
+  
+  // If HWID matches OR no HWID set yet → direct login
+  if (!user.hwid || user.hwid === hwid) {
+    if (!user.hwid) {
+      await pool.query('UPDATE users SET hwid = $1 WHERE id = $2', [hwid, user.id]);
+    }
+    const token = generateToken();
+    const tokenExpires = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
+    await pool.query(
+      'INSERT INTO auth_tokens (token, user_id, hwid, expires_at) VALUES ($1, $2, $3, $4)',
+      [token, user.id, hwid, tokenExpires]
+    );
+    await pool.query('INSERT INTO logs (telegram_id, action, details) VALUES ($1, $2, $3)',
+      [user.telegram_id, 'LOGIN', `Login: ${login}`]);
+    return res.json({ 
+      success: true, 
+      token,
+      user: { id: user.id, login: user.login, telegram_id: user.telegram_id }
+    });
+  }
+  
+  // HWID mismatch → require Telegram confirmation
+  const sessionId = uuidv4();
+  const code = generateCode();
+  const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
+  
+  await pool.query(
+    `INSERT INTO auth_sessions (session_id, type, login, telegram_id, hwid, code, expires_at)
+     VALUES ($1, 'login_2fa', $2, $3, $4, $5, $6)`,
+    [sessionId, login, user.telegram_id, hwid, code, expiresAt]
+  );
+  
+  await notifyTelegram(user.telegram_id,
+    `⚠️ <b>Вход с нового устройства</b>\n\nКод: <code>${code}</code>\n\nЕсли это не вы — проигнорируйте.`);
+  
+  res.json({ 
+    success: true, 
+    require_2fa: true, 
+    session_id: sessionId,
+    message: 'Code sent to Telegram for new device'
+  });
+}));
+
+// Confirm login from new device
+app.post('/api/auth/login/confirm', authMiddleware, asyncHandler(async (req, res) => {
+  const { session_id, code } = req.body;
+  
+  if (!session_id || !code) {
+    return res.status(400).json({ success: false, message: 'session_id and code required' });
+  }
+  
+  const result = await pool.query(
+    `SELECT * FROM auth_sessions WHERE session_id = $1 AND type = 'login_2fa' AND verified = false`,
+    [session_id]
+  );
+  if (result.rows.length === 0) {
+    return res.json({ success: false, message: 'Invalid session' });
+  }
+  
+  const session = result.rows[0];
+  if (new Date(session.expires_at) < new Date()) {
+    return res.json({ success: false, message: 'Code expired' });
+  }
+  if (session.code !== code.toString()) {
+    return res.json({ success: false, message: 'Invalid code' });
+  }
+  
+  const userRes = await pool.query('SELECT * FROM users WHERE login = $1', [session.login]);
+  if (userRes.rows.length === 0) {
+    return res.json({ success: false, message: 'User not found' });
+  }
+  const user = userRes.rows[0];
+  
+  // Update HWID to new device
+  await pool.query('UPDATE users SET hwid = $1 WHERE id = $2', [session.hwid, user.id]);
+  await pool.query('UPDATE auth_sessions SET verified = true WHERE session_id = $1', [session_id]);
+  
+  const token = generateToken();
+  const tokenExpires = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
+  await pool.query(
+    'INSERT INTO auth_tokens (token, user_id, hwid, expires_at) VALUES ($1, $2, $3, $4)',
+    [token, user.id, session.hwid, tokenExpires]
+  );
+  
+  await pool.query('INSERT INTO logs (telegram_id, action, details) VALUES ($1, $2, $3)',
+    [user.telegram_id, 'LOGIN_2FA', `New HWID for ${session.login}`]);
+  
+  res.json({ 
+    success: true, 
+    token,
+    user: { id: user.id, login: user.login, telegram_id: user.telegram_id }
+  });
+}));
+
+// Verify token (used by client on launch)
+app.post('/api/auth/verify', authMiddleware, asyncHandler(async (req, res) => {
+  const { token, hwid } = req.body;
+  
+  if (!token) {
+    return res.status(400).json({ success: false, message: 'Token required' });
+  }
+  
+  const result = await pool.query(
+    `SELECT t.*, u.login, u.telegram_id, u.is_active
+     FROM auth_tokens t JOIN users u ON t.user_id = u.id
+     WHERE t.token = $1`, [token]
+  );
+  
+  if (result.rows.length === 0) {
+    return res.json({ success: false, message: 'Invalid token' });
+  }
+  
+  const row = result.rows[0];
+  if (new Date(row.expires_at) < new Date()) {
+    return res.json({ success: false, message: 'Token expired' });
+  }
+  if (!row.is_active) {
+    return res.json({ success: false, message: 'Account banned' });
+  }
+  if (hwid && row.hwid !== hwid) {
+    return res.json({ success: false, message: 'HWID mismatch' });
+  }
+  
+  res.json({ 
+    success: true, 
+    user: { login: row.login, telegram_id: row.telegram_id }
+  });
+}));
+
+// Logout
+app.post('/api/auth/logout', authMiddleware, asyncHandler(async (req, res) => {
+  const { token } = req.body;
+  if (token) {
+    await pool.query('DELETE FROM auth_tokens WHERE token = $1', [token]);
+  }
+  res.json({ success: true });
+}));
 
 // Validate license
 app.post('/api/license/validate', asyncHandler(async (req, res) => {
