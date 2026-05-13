@@ -260,10 +260,12 @@ app.use((err, req, res, next) => {
 const adminKeyboard = {
   reply_markup: {
     inline_keyboard: [
-      [{ text: 'Создать ключ', callback_data: 'admin_create' }],
-      [{ text: 'Список лицензий', callback_data: 'admin_licenses' }],
-      [{ text: 'Статистика', callback_data: 'admin_stats' }],
-      [{ text: 'Пользователи', callback_data: 'admin_users' }]
+      [{ text: '➕ Создать ключ', callback_data: 'admin_create' }],
+      [{ text: '📜 Список лицензий', callback_data: 'admin_licenses' }],
+      [{ text: '📊 Статистика', callback_data: 'admin_stats' }],
+      [{ text: '👤 Пользователи', callback_data: 'admin_users' }],
+      [{ text: '🔍 Поиск', callback_data: 'admin_search' }],
+      [{ text: '📋 Логи', callback_data: 'admin_logs' }]
     ]
   }
 };
@@ -271,8 +273,8 @@ const adminKeyboard = {
 const userKeyboard = {
   reply_markup: {
     inline_keyboard: [
-      [{ text: 'Мой профиль', callback_data: 'user_profile' }],
-      [{ text: 'Проверить лицензию', callback_data: 'user_check_license' }]
+      [{ text: '👤 Мой профиль', callback_data: 'user_profile' }],
+      [{ text: '🔑 Проверить лицензию', callback_data: 'user_check_license' }]
     ]
   }
 };
@@ -312,7 +314,9 @@ telegramBot.onText(/\/createkey\s+(\d+)\s+(\S+)/, async (msg, match) => {
       'INSERT INTO licenses (key, telegram_id, duration_days, expires_at) VALUES ($1, $2, $3, $4)',
       [key, targetUser, duration, expiresAt]
     );
-    await telegramBot.sendMessage(msg.chat.id, `Ключ создан:\n<code>${key}</code>\nДействует: ${duration} дней\nДля: ${targetUser}`, { parse_mode: 'HTML' });
+    await pool.query('INSERT INTO logs (telegram_id, action, details) VALUES ($1, $2, $3)', 
+      [userId, 'CREATE_KEY', `Created ${key} for ${targetUser}, ${duration}d`]);
+    await telegramBot.sendMessage(msg.chat.id, `✅ Ключ создан:\n<code>${key}</code>\nДействует: ${duration} дней\nДля: ${targetUser}`, { parse_mode: 'HTML' });
     await telegramBot.sendMessage(targetUser, `Вам выдан ключ:\n<code>${key}</code>\nДействует: ${duration} дней`, { parse_mode: 'HTML' });
   } catch (err) {
     console.error('Create key error:', err);
@@ -329,7 +333,9 @@ telegramBot.onText(/\/revoke\s+(\S+)/, async (msg, match) => {
   const key = match[1];
   try {
     await pool.query('UPDATE licenses SET is_active = false WHERE key = $1', [key]);
-    await telegramBot.sendMessage(msg.chat.id, `Ключ <code>${key}</code> отозван.`, { parse_mode: 'HTML' });
+    await pool.query('INSERT INTO logs (telegram_id, action, details) VALUES ($1, $2, $3)', 
+      [userId, 'REVOKE_KEY', `Revoked ${key}`]);
+    await telegramBot.sendMessage(msg.chat.id, `❌ Ключ <code>${key}</code> отозван.`, { parse_mode: 'HTML' });
   } catch (err) {
     await telegramBot.sendMessage(msg.chat.id, 'Ошибка.');
   }
@@ -345,11 +351,224 @@ telegramBot.onText(/\/stats/, async (msg) => {
     const totalUsers = await pool.query('SELECT COUNT(*) FROM users');
     const totalLicenses = await pool.query('SELECT COUNT(*) FROM licenses');
     const activeLicenses = await pool.query('SELECT COUNT(*) FROM licenses WHERE is_active = true');
+    const expiredLicenses = await pool.query('SELECT COUNT(*) FROM licenses WHERE expires_at < NOW()');
+    const boundLicenses = await pool.query('SELECT COUNT(*) FROM licenses WHERE hwid_bound = true');
     
     await telegramBot.sendMessage(msg.chat.id, 
-      `📊 Статистика:\n\n👤 Пользователей: ${totalUsers.rows[0].count}\n🔑 Всего ключей: ${totalLicenses.rows[0].count}\n✅ Активных: ${activeLicenses.rows[0].count}`);
+      `📊 Статистика:\n\n` +
+      `👤 Пользователей: ${totalUsers.rows[0].count}\n` +
+      `🔑 Всего ключей: ${totalLicenses.rows[0].count}\n` +
+      `✅ Активных: ${activeLicenses.rows[0].count}\n` +
+      `❌ Истекших: ${expiredLicenses.rows[0].count}\n` +
+      `🔒 С привязкой HWID: ${boundLicenses.rows[0].count}`);
   } catch (err) {
     await telegramBot.sendMessage(msg.chat.id, 'Ошибка получения статистики.');
+  }
+});
+
+// Extend license
+telegramBot.onText(/\/extendkey\s+(\S+)\s+(\d+)/, async (msg, match) => {
+  const userId = msg.from.id.toString();
+  if (!await isAdmin(userId)) {
+    return telegramBot.sendMessage(msg.chat.id, 'Нет доступа.');
+  }
+  
+  const key = match[1];
+  const additionalDays = parseInt(match[2]);
+  
+  try {
+    const result = await pool.query('SELECT expires_at FROM licenses WHERE key = $1', [key]);
+    if (result.rows.length === 0) {
+      return telegramBot.sendMessage(msg.chat.id, '❌ Ключ не найден.');
+    }
+    
+    const currentExpiry = new Date(result.rows[0].expires_at);
+    currentExpiry.setDate(currentExpiry.getDate() + additionalDays);
+    
+    await pool.query('UPDATE licenses SET expires_at = $1 WHERE key = $2', [currentExpiry, key]);
+    await pool.query('INSERT INTO logs (telegram_id, action, details) VALUES ($1, $2, $3)', 
+      [userId, 'EXTEND_KEY', `Extended ${key} by ${additionalDays}d`]);
+    
+    await telegramBot.sendMessage(msg.chat.id, 
+      `✅ Ключ <code>${key}</code> продлен на ${additionalDays} дней.\n📅 Новая дата: ${currentExpiry.toLocaleDateString()}`, { parse_mode: 'HTML' });
+  } catch (err) {
+    console.error('Extend error:', err);
+    await telegramBot.sendMessage(msg.chat.id, '❌ Ошибка продления ключа.');
+  }
+});
+
+// Reset HWID binding
+telegramBot.onText(/\/reset_hwid\s+(\S+)/, async (msg, match) => {
+  const userId = msg.from.id.toString();
+  if (!await isAdmin(userId)) {
+    return telegramBot.sendMessage(msg.chat.id, 'Нет доступа.');
+  }
+  
+  const key = match[1];
+  
+  try {
+    await pool.query('UPDATE licenses SET hwid = NULL, hwid_bound = false WHERE key = $1', [key]);
+    await pool.query('INSERT INTO logs (telegram_id, action, details) VALUES ($1, $2, $3)', 
+      [userId, 'RESET_HWID', `Reset HWID for ${key}`]);
+    
+    await telegramBot.sendMessage(msg.chat.id, `✅ HWID сброшен для <code>${key}</code>.`, { parse_mode: 'HTML' });
+  } catch (err) {
+    console.error('Reset HWID error:', err);
+    await telegramBot.sendMessage(msg.chat.id, '❌ Ошибка сброса HWID.');
+  }
+});
+
+// Show user keys
+telegramBot.onText(/\/userkeys\s+(\S+)/, async (msg, match) => {
+  const userId = msg.from.id.toString();
+  if (!await isAdmin(userId)) {
+    return telegramBot.sendMessage(msg.chat.id, 'Нет доступа.');
+  }
+  
+  const targetUser = match[1];
+  
+  try {
+    const result = await pool.query('SELECT key, is_active, expires_at, hwid_bound FROM licenses WHERE telegram_id = $1 ORDER BY created_at DESC', [targetUser]);
+    if (result.rows.length === 0) {
+      return telegramBot.sendMessage(msg.chat.id, '❌ У пользователя нет ключей.');
+    }
+    
+    let text = `🔑 Ключи пользователя ${targetUser}:\n\n`;
+    result.rows.forEach(row => {
+      const status = row.is_active ? '✅' : '❌';
+      const bound = row.hwid_bound ? '🔒' : '🔓';
+      const expired = new Date(row.expires_at) < new Date() ? ' (ИСТЕК)' : '';
+      text += `${status} ${bound} <code>${row.key}</code>\n📅 ${new Date(row.expires_at).toLocaleDateString()}${expired}\n\n`;
+    });
+    await telegramBot.sendMessage(msg.chat.id, text, { parse_mode: 'HTML' });
+  } catch (err) {
+    console.error('User keys error:', err);
+    await telegramBot.sendMessage(msg.chat.id, '❌ Ошибка получения ключей.');
+  }
+});
+
+// Ban user
+telegramBot.onText(/\/banuser\s+(\S+)/, async (msg, match) => {
+  const userId = msg.from.id.toString();
+  if (!await isAdmin(userId)) {
+    return telegramBot.sendMessage(msg.chat.id, 'Нет доступа.');
+  }
+  
+  const targetUser = match[1];
+  
+  try {
+    await pool.query('UPDATE users SET is_active = false WHERE telegram_id = $1', [targetUser]);
+    await pool.query('UPDATE licenses SET is_active = false WHERE telegram_id = $1', [targetUser]);
+    await pool.query('INSERT INTO logs (telegram_id, action, details) VALUES ($1, $2, $3)', 
+      [userId, 'BAN_USER', `Banned ${targetUser}`]);
+    
+    await telegramBot.sendMessage(msg.chat.id, `🚫 Пользователь ${targetUser} забанен.\nВсе его лицензии отключены.`);
+  } catch (err) {
+    console.error('Ban error:', err);
+    await telegramBot.sendMessage(msg.chat.id, '❌ Ошибка бана.');
+  }
+});
+
+// Unban user
+telegramBot.onText(/\/unbanuser\s+(\S+)/, async (msg, match) => {
+  const userId = msg.from.id.toString();
+  if (!await isAdmin(userId)) {
+    return telegramBot.sendMessage(msg.chat.id, 'Нет доступа.');
+  }
+  
+  const targetUser = match[1];
+  
+  try {
+    await pool.query('UPDATE users SET is_active = true WHERE telegram_id = $1', [targetUser]);
+    await pool.query('INSERT INTO logs (telegram_id, action, details) VALUES ($1, $2, $3)', 
+      [userId, 'UNBAN_USER', `Unbanned ${targetUser}`]);
+    
+    await telegramBot.sendMessage(msg.chat.id, `✅ Пользователь ${targetUser} разбанен.`);
+  } catch (err) {
+    console.error('Unban error:', err);
+    await telegramBot.sendMessage(msg.chat.id, '❌ Ошибка разбана.');
+  }
+});
+
+// Show logs
+telegramBot.onText(/\/logs/, async (msg) => {
+  const userId = msg.from.id.toString();
+  if (!await isAdmin(userId)) {
+    return telegramBot.sendMessage(msg.chat.id, 'Нет доступа.');
+  }
+  
+  try {
+    const result = await pool.query('SELECT telegram_id, action, details, created_at FROM logs ORDER BY created_at DESC LIMIT 15');
+    if (result.rows.length === 0) {
+      return telegramBot.sendMessage(msg.chat.id, '📋 Логи пусты.');
+    }
+    
+    let text = '📋 Последние действия:\n\n';
+    result.rows.forEach(row => {
+      text += `[${new Date(row.created_at).toLocaleDateString()}] ${row.action}: ${row.details}\n`;
+    });
+    await telegramBot.sendMessage(msg.chat.id, text);
+  } catch (err) {
+    console.error('Logs error:', err);
+    await telegramBot.sendMessage(msg.chat.id, '❌ Ошибка получения логов.');
+  }
+});
+
+// Find user by ID
+telegramBot.onText(/\/finduser\s+(\S+)/, async (msg, match) => {
+  const userId = msg.from.id.toString();
+  if (!await isAdmin(userId)) {
+    return telegramBot.sendMessage(msg.chat.id, 'Нет доступа.');
+  }
+  
+  const targetUser = match[1];
+  
+  try {
+    const result = await pool.query('SELECT * FROM users WHERE telegram_id = $1', [targetUser]);
+    if (result.rows.length === 0) {
+      return telegramBot.sendMessage(msg.chat.id, '❌ Пользователь не найден.');
+    }
+    
+    const user = result.rows[0];
+    const keys = await pool.query('SELECT key, is_active, expires_at FROM licenses WHERE telegram_id = $1', [targetUser]);
+    
+    let text = `👤 Пользователь:\n\n`;
+    text += `ID: ${user.telegram_id}\n`;
+    text += `Имя: @${user.username || 'unknown'}\n`;
+    text += `HWID: ${user.hwid ? '✅ ' + user.hwid : '❌ не привязан'}\n`;
+    text += `Активен: ${user.is_active ? '✅' : '❌'}\n`;
+    text += `Ключей: ${keys.rows.length}\n\n`;
+    
+    keys.rows.forEach(row => {
+      const status = row.is_active ? '✅' : '❌';
+      text += `${status} <code>${row.key}</code> — ${new Date(row.expires_at).toLocaleDateString()}\n`;
+    });
+    
+    await telegramBot.sendMessage(msg.chat.id, text, { parse_mode: 'HTML' });
+  } catch (err) {
+    console.error('Find user error:', err);
+    await telegramBot.sendMessage(msg.chat.id, '❌ Ошибка поиска.');
+  }
+});
+
+// Delete key
+telegramBot.onText(/\/delkey\s+(\S+)/, async (msg, match) => {
+  const userId = msg.from.id.toString();
+  if (!await isAdmin(userId)) {
+    return telegramBot.sendMessage(msg.chat.id, 'Нет доступа.');
+  }
+  
+  const key = match[1];
+  
+  try {
+    await pool.query('DELETE FROM licenses WHERE key = $1', [key]);
+    await pool.query('INSERT INTO logs (telegram_id, action, details) VALUES ($1, $2, $3)', 
+      [userId, 'DELETE_KEY', `Deleted ${key}`]);
+    
+    await telegramBot.sendMessage(msg.chat.id, `🗑 Ключ <code>${key}</code> удален.`, { parse_mode: 'HTML' });
+  } catch (err) {
+    console.error('Delete key error:', err);
+    await telegramBot.sendMessage(msg.chat.id, '❌ Ошибка удаления.');
   }
 });
 
@@ -360,9 +579,11 @@ telegramBot.on('callback_query', async (query) => {
   
   try {
     if (data === 'admin_create') {
-      await telegramBot.sendMessage(chatId, 'Используйте: /createkey <дни> <telegram_id>');
+      await telegramBot.sendMessage(chatId, 'Используйте:\n<code>/createkey &lt;дни&gt; &lt;telegram_id&gt;</code>\n\nПример: /createkey 30 123456789', { parse_mode: 'HTML' });
     } else if (data === 'admin_stats') {
-      telegramBot.emitText(/^\/stats/, query.message);
+      const msg = { chat: { id: chatId }, from: { id: parseInt(userId) } };
+      telegramBot.emit('text', msg);
+      telegramBot.processUpdate({ update_id: Date.now(), message: msg });
     } else if (data === 'admin_licenses') {
       const admin = await isAdmin(userId);
       if (!admin) return telegramBot.sendMessage(chatId, 'Нет доступа.');
@@ -376,12 +597,28 @@ telegramBot.on('callback_query', async (query) => {
     } else if (data === 'admin_users') {
       const admin = await isAdmin(userId);
       if (!admin) return telegramBot.sendMessage(chatId, 'Нет доступа.');
-      const result = await pool.query('SELECT telegram_id, username, created_at FROM users ORDER BY created_at DESC LIMIT 20');
+      const result = await pool.query('SELECT telegram_id, username, created_at, is_active FROM users ORDER BY created_at DESC LIMIT 20');
       let text = '👤 Пользователи:\n\n';
       result.rows.forEach(row => {
-        text += `@${row.username || row.telegram_id} - ${new Date(row.created_at).toLocaleDateString()}\n`;
+        const status = row.is_active ? '✅' : '❌';
+        text += `${status} @${row.username || row.telegram_id} - ${new Date(row.created_at).toLocaleDateString()}\n`;
       });
       await telegramBot.sendMessage(chatId, text);
+    } else if (data === 'admin_search') {
+      await telegramBot.sendMessage(chatId, 'Используйте:\n<code>/finduser &lt;telegram_id&gt;</code>\n\nПример: /finduser 123456789', { parse_mode: 'HTML' });
+    } else if (data === 'admin_logs') {
+      const admin = await isAdmin(userId);
+      if (!admin) return telegramBot.sendMessage(chatId, 'Нет доступа.');
+      const result = await pool.query('SELECT telegram_id, action, details, created_at FROM logs ORDER BY created_at DESC LIMIT 15');
+      if (result.rows.length === 0) {
+        await telegramBot.sendMessage(chatId, '📋 Логи пусты.');
+      } else {
+        let text = '📋 Последние действия:\n\n';
+        result.rows.forEach(row => {
+          text += `[${new Date(row.created_at).toLocaleDateString()}] ${row.action}: ${row.details}\n`;
+        });
+        await telegramBot.sendMessage(chatId, text);
+      }
     } else if (data === 'user_profile') {
       const result = await pool.query('SELECT * FROM users WHERE telegram_id = $1', [userId]);
       if (result.rows.length === 0) {
@@ -398,14 +635,14 @@ telegramBot.on('callback_query', async (query) => {
   }
 });
 
-// Webhook endpoint for Telegram
-app.post('/webhook', express.raw({type: 'application/json'}), (req, res) => {
+// Webhook endpoint for Telegram - must use express.json() to get parsed object
+app.post('/webhook', (req, res) => {
   try {
     telegramBot.processUpdate(req.body);
     res.sendStatus(200);
   } catch (err) {
     console.error('Webhook error:', err);
-    res.sendStatus(500);
+    res.sendStatus(200); // Always return 200 to Telegram
   }
 });
 
